@@ -4,8 +4,9 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from scan_members import (collect_admin_log, collect_search_sweep, read_approved,
-                          progress_bar, risk, rotate_session, start_time, write_reports)
+from scan_members import (ban_approved, collect_admin_log, collect_search_sweep,
+                          read_approved, progress_bar, risk, rotate_session,
+                          start_time, write_reports)
 
 
 class ScannerTests(unittest.TestCase):
@@ -65,6 +66,16 @@ class ScannerTests(unittest.TestCase):
             backup = rotate_session(session)
             self.assertFalse(original.exists())
             self.assertEqual(backup.read_text(encoding='utf-8'), 'bot session')
+
+    def test_ban_rejects_protected_admin_before_api_calls(self):
+        class API:
+            def call(self, *args, **kwargs):
+                raise AssertionError('API must not be called')
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, 'защищённые администраторы'):
+                ban_approved(API(), -100, [1, 2], {1, 2}, Path(directory) / 'audit.json',
+                             protected_ids={2})
 
 
 class AdminLogTests(unittest.IsolatedAsyncioTestCase):

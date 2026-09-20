@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import time as clock
 from collections import Counter
 from datetime import date, datetime, time, timezone
 from pathlib import Path
@@ -55,6 +56,16 @@ class ProgressDisplay:
 
     def finish_events(self, count, found):
         self._write(f"✓ событий прочитано {count} · уникальных аккаунтов {found} · готово")
+        self.close()
+
+    def ban(self, done, total, succeeded, failed, uid, wait=0):
+        pending = max(total - done, 0)
+        label = (f"пауза Telegram {wait}с" if wait else
+                 f"ID {uid} · удалено {succeeded} · ошибок {failed}")
+        self._write(progress_bar(done, pending, succeeded, label))
+
+    def finish_ban(self, total, succeeded, failed):
+        self._write(progress_bar(total, 0, succeeded, f"ошибок {failed} · готово"))
         self.close()
 
     def close(self):
@@ -316,18 +327,45 @@ def write_reports(records, admins, zone, output_dir):
     return csv_path, approval_path, prepared
 
 
-def ban_approved(api, chat, ids, known_ids, audit_path):
+def ban_approved(api, chat, ids, known_ids, audit_path, protected_ids=None, progress=None):
     unknown = [uid for uid in ids if uid not in known_ids]
     if unknown:
         raise ValueError("В approved-файле есть ID не из текущего отчёта: " + ", ".join(map(str, unknown[:10])))
+    protected = [uid for uid in ids if uid in (protected_ids or set())]
+    if protected:
+        raise ValueError("В approved-файле есть защищённые администраторы: " +
+                         ", ".join(map(str, protected[:10])))
     results = []
-    for uid in ids:
-        try:
-            api.call("banChatMember", chat_id=chat, user_id=uid, revoke_messages=True)
-            results.append({"id": uid, "result": "banned"})
-        except APIError as exc:
-            results.append({"id": uid, "result": "error", "code": exc.code})
-    audit_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+    succeeded = failed = 0
+    try:
+        for index, uid in enumerate(ids, 1):
+            attempts = 0
+            while True:
+                try:
+                    api.call("banChatMember", chat_id=chat, user_id=uid, revoke_messages=True)
+                    results.append({"id": uid, "result": "banned"})
+                    succeeded += 1
+                    break
+                except APIError as exc:
+                    attempts += 1
+                    if exc.code == 429 and attempts <= 5:
+                        wait = min(max(exc.retry_after, 1), 60)
+                        if progress:
+                            progress.ban(index - 1, len(ids), succeeded, failed, uid, wait)
+                        clock.sleep(wait)
+                        continue
+                    results.append({"id": uid, "result": "error", "code": exc.code,
+                                    "description": exc.description})
+                    failed += 1
+                    break
+            if progress:
+                progress.ban(index, len(ids), succeeded, failed, uid)
+            if index % 10 == 0:
+                audit_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+    finally:
+        audit_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+        if progress:
+            progress.finish_ban(len(results), succeeded, failed)
     return results
 
 
@@ -422,7 +460,8 @@ async def async_main(args):
         if not ids:
             raise SystemExit("В файле нет раскомментированных ID; блокировка не запускалась.")
         audit_path = Path(args.output_dir) / f"ban-audit-{datetime.now(zone).strftime('%Y%m%d-%H%M%S')}.json"
-        results = ban_approved(bot_api, target, ids, {r["id"] for r in prepared}, audit_path)
+        results = ban_approved(bot_api, target, ids, {r["id"] for r in prepared}, audit_path,
+                               protected_ids=admins | {me["id"]}, progress=progress)
         print(f"Заблокировано: {sum(r['result'] == 'banned' for r in results)}; "
               f"ошибок: {sum(r['result'] == 'error' for r in results)}")
         print(f"Журнал блокировки: {audit_path}")
