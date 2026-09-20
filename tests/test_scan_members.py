@@ -5,7 +5,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from scan_members import (collect_admin_log, collect_search_sweep, read_approved,
-                          risk, rotate_session, start_time, write_reports)
+                          progress_bar, risk, rotate_session, start_time, write_reports)
 
 
 class ScannerTests(unittest.TestCase):
@@ -49,6 +49,13 @@ class ScannerTests(unittest.TestCase):
     def test_since_uses_requested_timezone(self):
         since, zone = start_time('2026-09-20', 'Europe/Saratov')
         self.assertEqual(since.astimezone(zone).hour, 0)
+
+    def test_progress_bar_shows_dynamic_queue_and_found_count(self):
+        line = progress_bar(25, 75, 321, 'префикс: а', width=10)
+        self.assertIn('25%', line)
+        self.assertIn('25/100', line)
+        self.assertIn('найдено 321', line)
+        self.assertIn('префикс: а', line)
 
     def test_rotate_session_keeps_backup(self):
         with tempfile.TemporaryDirectory() as directory:

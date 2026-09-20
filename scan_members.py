@@ -14,6 +14,54 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from bot import API, APIError
 
 SEARCH_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789абвгдеёжзийклмнопрстуфхцчшщъыьэюяіїєґ"
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def progress_bar(done, pending, found, label="", width=28):
+    total = done + pending
+    ratio = done / total if total else 1.0
+    filled = min(width, round(width * ratio))
+    bar = "█" * filled + "░" * (width - filled)
+    percent = round(ratio * 100)
+    suffix = f" · {label}" if label else ""
+    return f"[{bar}] {percent:3d}% · запросов {done}/{total} · найдено {found}{suffix}"
+
+
+class ProgressDisplay:
+    def __init__(self, enabled=True, stream=None):
+        self.stream = stream or sys.stdout
+        self.enabled = enabled and self.stream.isatty()
+        self.visible = False
+
+    def _write(self, text):
+        if self.enabled:
+            self.stream.write("\r\033[K" + text)
+            self.stream.flush()
+            self.visible = True
+
+    def sweep(self, done, pending, found, prefix):
+        self._write(progress_bar(done, pending, found, f"префикс: {prefix}"))
+
+    def events(self, count, found, event_date=None):
+        if count % 10 and count != 1:
+            return
+        spinner = SPINNER[count % len(SPINNER)]
+        when = f" · {event_date:%Y-%m-%d %H:%M:%S}" if event_date else ""
+        self._write(f"{spinner} событий прочитано {count} · уникальных аккаунтов {found}{when}")
+
+    def finish_sweep(self, done, found):
+        self._write(progress_bar(done, 0, found, "готово"))
+        self.close()
+
+    def finish_events(self, count, found):
+        self._write(f"✓ событий прочитано {count} · уникальных аккаунтов {found} · готово")
+        self.close()
+
+    def close(self):
+        if self.enabled and self.visible:
+            self.stream.write("\n")
+            self.stream.flush()
+            self.visible = False
 
 
 def load_env(path=Path(".env")):
@@ -168,7 +216,7 @@ def merge_record(records, row):
         previous["source"].update(row["source"])
 
 
-async def collect_search_sweep(client, channel, since, initial, max_queries=500):
+async def collect_search_sweep(client, channel, since, initial, max_queries=500, progress=None):
     """Best-effort partitioning of Telegram's capped participant search results."""
     records = {row["id"]: row for row in initial}
     queue = list(SEARCH_ALPHABET)
@@ -185,16 +233,22 @@ async def collect_search_sweep(client, channel, since, initial, max_queries=500)
                 queue.extend(prefix + char for char in SEARCH_ALPHABET)
             else:
                 saturated.append(prefix)
+        if progress:
+            progress.sweep(queries, len(queue), len(records), prefix)
+    if progress:
+        progress.finish_sweep(queries, len(records))
     return list(records.values()), queries, saturated, len(queue)
 
 
-async def collect_admin_log(client, channel, since):
+async def collect_admin_log(client, channel, since, progress=None):
     """Collect all join events since a date. Telegram permits this only for user accounts."""
     records = {}
+    events_read = 0
     async for event in client.iter_admin_log(channel, limit=None, join=True, invite=True):
         event_date = event.date if event.date.tzinfo else event.date.replace(tzinfo=timezone.utc)
         if event_date < since:
             break
+        events_read += 1
         participant = getattr(event.action, "participant", None)
         uid = getattr(participant, "user_id", None) or event.user_id
         try:
@@ -215,6 +269,10 @@ async def collect_admin_log(client, channel, since):
             row["bot"] = bool(getattr(entity, "bot", False))
             row["deleted"] = bool(getattr(entity, "deleted", False))
             row["photo"] = getattr(entity, "photo", None) is not None
+        if progress:
+            progress.events(events_read, len(records), event_date)
+    if progress:
+        progress.finish_events(events_read, len(records))
     return list(records.values())
 
 
@@ -281,8 +339,8 @@ async def async_main(args):
     load_env()
     if args.full_log and args.search_sweep:
         raise SystemExit("Выберите один режим: --full-log или --search-sweep")
-    if not 1 <= args.max_search_queries <= 2000:
-        raise SystemExit("--max-search-queries должен быть от 1 до 2000")
+    if not 1 <= args.max_search_queries <= 4000:
+        raise SystemExit("--max-search-queries должен быть от 1 до 4000")
     token = os.environ.get("BOT_TOKEN", "")
     api_hash = os.environ.get("TELEGRAM_API_HASH", "")
     try:
@@ -313,6 +371,7 @@ async def async_main(args):
         backup = rotate_session(session)
         print(f"Предыдущая сессия перемещена в {backup}" if backup else "Сохранённой пользовательской сессии не было.")
     client = TelegramClient(str(session), api_id, api_hash, receive_updates=False)
+    progress = ProgressDisplay(enabled=not args.no_progress)
     if args.full_log:
         print("Полный режим: войдите личным аккаунтом — администратором канала.")
         print("Код и пароль 2FA вводятся локально в Telethon и не записываются в отчёт.")
@@ -327,17 +386,18 @@ async def async_main(args):
     try:
         channel = await resolve_chat(client, target)
         if args.full_log:
-            records = await collect_admin_log(client, channel, since)
+            records = await collect_admin_log(client, channel, since, progress)
             sweep_info = None
         else:
             records = await collect(client, channel, since)
             if args.search_sweep:
                 records, queries, saturated, pending = await collect_search_sweep(
-                    client, channel, since, records, args.max_search_queries)
+                    client, channel, since, records, args.max_search_queries, progress)
                 sweep_info = (queries, saturated, pending)
             else:
                 sweep_info = None
     finally:
+        progress.close()
         await client.disconnect()
     csv_path, approval_path, prepared = write_reports(records, admins, zone, Path(args.output_dir))
     candidates = sum(1 for row in prepared if row["candidate"])
@@ -380,6 +440,8 @@ def parser():
                         help="собрать больше участников серией поисковых запросов без личного аккаунта")
     result.add_argument("--max-search-queries", type=int, default=500,
                         help="максимум запросов поискового обхода (по умолчанию 500)")
+    result.add_argument("--no-progress", action="store_true",
+                        help="не показывать динамический прогресс в терминале")
     result.add_argument("--reset-user-session", action="store_true",
                         help="переместить ошибочную личную сессию в резервную копию и войти заново")
     result.add_argument("--apply", metavar="APPROVED_IDS", help="файл с подтверждёнными ID")
