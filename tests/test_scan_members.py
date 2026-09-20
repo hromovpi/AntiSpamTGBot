@@ -5,8 +5,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from scan_members import (ban_approved, collect_admin_log, collect_search_sweep,
-                          read_approved, progress_bar, risk, rotate_session,
-                          start_time, write_reports)
+                          read_approved, remove_approved_reactions, progress_bar,
+                          risk, rotate_session, start_time, write_reports)
 
 
 class ScannerTests(unittest.TestCase):
@@ -79,6 +79,26 @@ class ScannerTests(unittest.TestCase):
 
 
 class AdminLogTests(unittest.IsolatedAsyncioTestCase):
+    async def test_removes_all_reactions_for_each_approved_id(self):
+        class Client:
+            def __init__(self):
+                self.requests = []
+
+            async def get_input_entity(self, entity):
+                return entity
+
+            async def __call__(self, request):
+                self.requests.append(request)
+
+        client = Client()
+        with tempfile.TemporaryDirectory() as directory:
+            audit = Path(directory) / 'reactions.json'
+            results = await remove_approved_reactions(client, -100, [11, 22], audit)
+            self.assertEqual([row['result'] for row in results],
+                             ['reactions_removed', 'reactions_removed'])
+            self.assertEqual([request.participant for request in client.requests], [11, 22])
+            self.assertEqual(len(__import__('json').loads(audit.read_text(encoding='utf-8'))), 2)
+
     async def test_invited_participant_id_is_used_instead_of_inviter(self):
         class Object:
             def __init__(self, **values):

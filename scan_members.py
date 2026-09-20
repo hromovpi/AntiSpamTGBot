@@ -68,6 +68,16 @@ class ProgressDisplay:
         self._write(progress_bar(total, 0, succeeded, f"ошибок {failed} · готово"))
         self.close()
 
+    def reactions(self, done, total, succeeded, failed, uid, wait=0):
+        pending = max(total - done, 0)
+        label = (f"пауза Telegram {wait}с" if wait else
+                 f"ID {uid} · очищено {succeeded} · ошибок {failed}")
+        self._write(progress_bar(done, pending, succeeded, label))
+
+    def finish_reactions(self, total, succeeded, failed):
+        self._write(progress_bar(total, 0, succeeded, f"ошибок {failed} · реакции очищены"))
+        self.close()
+
     def close(self):
         if self.enabled and self.visible:
             self.stream.write("\n")
@@ -327,7 +337,7 @@ def write_reports(records, admins, zone, output_dir):
     return csv_path, approval_path, prepared
 
 
-def ban_approved(api, chat, ids, known_ids, audit_path, protected_ids=None, progress=None):
+def validate_approved(ids, known_ids, protected_ids=None):
     unknown = [uid for uid in ids if uid not in known_ids]
     if unknown:
         raise ValueError("В approved-файле есть ID не из текущего отчёта: " + ", ".join(map(str, unknown[:10])))
@@ -335,6 +345,56 @@ def ban_approved(api, chat, ids, known_ids, audit_path, protected_ids=None, prog
     if protected:
         raise ValueError("В approved-файле есть защищённые администраторы: " +
                          ", ".join(map(str, protected[:10])))
+
+
+async def remove_approved_reactions(client, channel, ids, audit_path, progress=None):
+    """Remove every reaction made by each approved participant in a channel."""
+    from telethon.errors import FloodWaitError
+    from telethon.tl.functions.messages import DeleteParticipantReactionsRequest
+
+    peer = await client.get_input_entity(channel)
+    results = []
+    succeeded = failed = 0
+    try:
+        for index, uid in enumerate(ids, 1):
+            attempts = 0
+            while True:
+                try:
+                    participant = await client.get_input_entity(uid)
+                    await client(DeleteParticipantReactionsRequest(peer=peer, participant=participant))
+                    results.append({"id": uid, "result": "reactions_removed"})
+                    succeeded += 1
+                    break
+                except FloodWaitError as exc:
+                    attempts += 1
+                    if attempts <= 5:
+                        wait = min(max(exc.seconds, 1), 300)
+                        if progress:
+                            progress.reactions(index - 1, len(ids), succeeded, failed, uid, wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    results.append({"id": uid, "result": "error", "code": "FLOOD_WAIT",
+                                    "description": str(exc)})
+                    failed += 1
+                    break
+                except Exception as exc:
+                    results.append({"id": uid, "result": "error", "code": type(exc).__name__,
+                                    "description": str(exc)})
+                    failed += 1
+                    break
+            if progress:
+                progress.reactions(index, len(ids), succeeded, failed, uid)
+            if index % 10 == 0:
+                audit_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+    finally:
+        audit_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+        if progress:
+            progress.finish_reactions(len(results), succeeded, failed)
+    return results
+
+
+def ban_approved(api, chat, ids, known_ids, audit_path, protected_ids=None, progress=None):
+    validate_approved(ids, known_ids, protected_ids)
     results = []
     succeeded = failed = 0
     try:
@@ -377,6 +437,8 @@ async def async_main(args):
     load_env()
     if args.full_log and args.search_sweep:
         raise SystemExit("Выберите один режим: --full-log или --search-sweep")
+    if args.remove_reactions and not args.apply:
+        raise SystemExit("--remove-reactions используется вместе с --apply ФАЙЛ и --confirm-ban")
     if not 1 <= args.max_search_queries <= 4000:
         raise SystemExit("--max-search-queries должен быть от 1 до 4000")
     token = os.environ.get("BOT_TOKEN", "")
@@ -459,9 +521,24 @@ async def async_main(args):
         ids = read_approved(approved_path)
         if not ids:
             raise SystemExit("В файле нет раскомментированных ID; блокировка не запускалась.")
+        known_ids = {r["id"] for r in prepared}
+        protected_ids = admins | {me["id"]}
+        validate_approved(ids, known_ids, protected_ids)
+        if args.remove_reactions:
+            reaction_audit_path = Path(args.output_dir) / f"reaction-audit-{datetime.now(zone).strftime('%Y%m%d-%H%M%S')}.json"
+            await client.connect()
+            try:
+                reaction_results = await remove_approved_reactions(
+                    client, channel, ids, reaction_audit_path, progress=progress)
+            finally:
+                progress.close()
+                await client.disconnect()
+            print(f"Реакции очищены у: {sum(r['result'] == 'reactions_removed' for r in reaction_results)}; "
+                  f"ошибок: {sum(r['result'] == 'error' for r in reaction_results)}")
+            print(f"Журнал очистки реакций: {reaction_audit_path}")
         audit_path = Path(args.output_dir) / f"ban-audit-{datetime.now(zone).strftime('%Y%m%d-%H%M%S')}.json"
-        results = ban_approved(bot_api, target, ids, {r["id"] for r in prepared}, audit_path,
-                               protected_ids=admins | {me["id"]}, progress=progress)
+        results = ban_approved(bot_api, target, ids, known_ids, audit_path,
+                               protected_ids=protected_ids, progress=progress)
         print(f"Заблокировано: {sum(r['result'] == 'banned' for r in results)}; "
               f"ошибок: {sum(r['result'] == 'error' for r in results)}")
         print(f"Журнал блокировки: {audit_path}")
@@ -484,6 +561,8 @@ def parser():
     result.add_argument("--reset-user-session", action="store_true",
                         help="переместить ошибочную личную сессию в резервную копию и войти заново")
     result.add_argument("--apply", metavar="APPROVED_IDS", help="файл с подтверждёнными ID")
+    result.add_argument("--remove-reactions", action="store_true",
+                        help="перед блокировкой удалить все реакции подтверждённых участников в канале")
     result.add_argument("--confirm-ban", action="store_true", help="явно разрешить блокировку ID из --apply")
     return result
 
